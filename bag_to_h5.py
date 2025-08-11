@@ -1,65 +1,117 @@
+#!/usr/bin/env python3
+import os
 import rosbag
+import rospy
 import numpy as np
 import h5py
-from tqdm import tqdm
+from typing import Optional, Tuple
 
-bag_path = '/home/aric/adasi/data/2025-08-10-18-39-47.bag'
-h5_path = '/home/aric/adasi/data/2025-08-10-18-39-47.h5'
+def _to_ros_time(sec: float) -> rospy.Time:
+    return rospy.Time.from_sec(float(sec))
 
-chunk_size = 100000  # adjust based on available memory
-events_buffer = []
+def _window_from_bag(bag: rosbag.Bag,
+                     start_offset: float,
+                     duration: Optional[float]) -> Tuple[rospy.Time, Optional[rospy.Time]]:
+    bag_start = bag.get_start_time()  # epoch seconds (float)
+    start_time = _to_ros_time(bag_start + float(start_offset))
+    end_time = None
+    if duration is not None:
+        end_time = _to_ros_time(bag_start + float(start_offset) + float(duration))
+    return start_time, end_time
 
-# Detect topic
-with rosbag.Bag(bag_path, 'r') as bag:
-    topics = bag.get_type_and_topic_info()[1].keys()
-    if '/capture_node/events' in topics:
-        event_topic = '/capture_node/events'
-    elif '/dvs/events' in topics:
-        event_topic = '/dvs/events'
-    else:
-        raise ValueError("No events topic found in bag file.")
-print(f"Using topic: {event_topic}")
+def convert_rosbag_to_h5(
+    bag_path: str,
+    output_h5_path: str,
+    start_offset_s: float = 0.0,
+    duration_s: Optional[float] = None,
+    events_topic: str = "/capture_node/events",
+    image_topic: Optional[str] = None,
+) -> None:
+    """
+    Convert a ROS bag to HDF5 with the SAME 'events_data' dataset structure as the old script.
 
-# First pass: count messages for progress bar
-print("Counting messages...")
-with rosbag.Bag(bag_path, 'r') as bag:
-    total_msgs = bag.get_message_count(topic_filters=[event_topic])
+    - events_data: Nx4 array [x, y, polarity, t_sec]  (exactly like the old code)
+    - If image_topic is provided, the following extra datasets are created:
+        image_timestamps_s : (M,) float64
+        image_height       : (M,) int32
+        image_width        : (M,) int32
+        image_step         : (M,) int32
+        image_encoding     : (M,) UTF-8 variable length strings
+        image_data         : (M,) variable length uint8 blobs (raw ROS bytes)
+    """
+    if not os.path.isfile(bag_path):
+        raise FileNotFoundError(f"Bag not found: {bag_path}")
 
-# Second pass: convert to HDF5 with tqdm
-with h5py.File(h5_path, 'w') as h5f:
-    # Add metadata
-    h5f.attrs['source_bag'] = bag_path
-    h5f.attrs['topic'] = event_topic
-    h5f.attrs['chunk_size'] = chunk_size
+    with rosbag.Bag(bag_path, "r") as bag:
+        start_time, end_time = _window_from_bag(bag, start_offset_s, duration_s)
 
-    dset = h5f.create_dataset(
-        'events_data',
-        shape=(0, 4),
-        maxshape=(None, 4),
-        dtype=np.float64,
-        chunks=(chunk_size, 4)
-    )
-
-    idx = 0
-    with rosbag.Bag(bag_path, 'r') as bag:
-        for _, msg, _ in tqdm(bag.read_messages(topics=[event_topic]),
-                              total=total_msgs, unit="msg", desc="Converting"):
+        # ---- Collect events (exact structure)
+        events = []
+        for topic, msg, t in bag.read_messages(topics=[events_topic], start_time=start_time, end_time=end_time):
+            # Expecting msg.events with fields: x, y, polarity, ts(secs,nsecs)
             for ev in msg.events:
-                t_sec = ev.ts.secs + (ev.ts.nsecs / 1e9)
-                events_buffer.append([ev.x, ev.y, ev.polarity, t_sec])
+                t_sec = float(ev.ts.secs) + float(ev.ts.nsecs) * 1e-9
+                events.append([int(ev.x), int(ev.y), int(ev.polarity), t_sec])
 
-            if len(events_buffer) >= chunk_size:
-                arr = np.array(events_buffer, dtype=np.float64)
-                dset.resize((idx + arr.shape[0], 4))
-                dset[idx:idx + arr.shape[0], :] = arr
-                idx += arr.shape[0]
-                events_buffer.clear()
-                h5f.flush()  # Ensure data is saved
+        events_array = np.array(events, dtype=np.float64) if events else np.zeros((0, 4), dtype=np.float64)
 
-        # Write any leftovers
-        if events_buffer:
-            arr = np.array(events_buffer, dtype=np.float64)
-            dset.resize((idx + arr.shape[0], 4))
-            dset[idx:idx + arr.shape[0], :] = arr
+        # ---- Write H5 (keep 'events_data' exactly as before)
+        with h5py.File(output_h5_path, "w") as h5f:
+            # EXACT dataset name + layout
+            h5f.create_dataset("events_data", data=events_array)
 
-print(f"✅ Done: Events saved to {h5_path}")
+            # ---- Optional: images (added as new datasets; does not affect events_data)
+            if image_topic:
+                # variable-length dtypes
+                vlen_bytes = h5py.vlen_dtype(np.dtype("uint8"))
+                vlen_str = h5py.string_dtype(encoding="utf-8")
+
+                # create empty, resizable datasets
+                ts_ds = h5f.create_dataset("image_timestamps_s", shape=(0,), maxshape=(None,), dtype=np.float64)
+                h_ds  = h5f.create_dataset("image_height",       shape=(0,), maxshape=(None,), dtype=np.int32)
+                w_ds  = h5f.create_dataset("image_width",        shape=(0,), maxshape=(None,), dtype=np.int32)
+                st_ds = h5f.create_dataset("image_step",         shape=(0,), maxshape=(None,), dtype=np.int32)
+                enc_ds= h5f.create_dataset("image_encoding",     shape=(0,), maxshape=(None,), dtype=vlen_str)
+                dat_ds= h5f.create_dataset("image_data",         shape=(0,), maxshape=(None,), dtype=vlen_bytes)
+
+                count = 0
+                for topic, msg, t in bag.read_messages(topics=[image_topic], start_time=start_time, end_time=end_time):
+                    count += 1
+                    ts = float(msg.header.stamp.secs) + float(msg.header.stamp.nsecs) * 1e-9
+
+                    # grow each dataset by 1 and append
+                    ts_ds.resize((count,))
+                    h_ds.resize((count,))
+                    w_ds.resize((count,))
+                    st_ds.resize((count,))
+                    enc_ds.resize((count,))
+                    dat_ds.resize((count,))
+
+                    ts_ds[count - 1]  = ts
+                    h_ds[count - 1]   = int(msg.height)
+                    w_ds[count - 1]   = int(msg.width)
+                    st_ds[count - 1]  = int(msg.step)
+                    enc_ds[count - 1] = getattr(msg, "encoding", "")
+                    dat_ds[count - 1] = np.frombuffer(msg.data, dtype=np.uint8)
+
+    print(f"Success — wrote {output_h5_path} (events: {events_array.shape[0]})")
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Convert ROS bag to HDF5 with 'events_data' layout.")
+    parser.add_argument("bag", help="Path to input .bag")
+    parser.add_argument("out", help="Path to output .h5")
+    parser.add_argument("--start_offset", type=float, default=0.0, help="Start offset from bag start (sec)")
+    parser.add_argument("--duration", type=float, default=None, help="Duration to process (sec), default: until end")
+    parser.add_argument("--events_topic", type=str, default="/capture_node/events", help="Events topic")
+    parser.add_argument("--image_topic", type=str, default=None, help="Optional image topic to also log")
+    args = parser.parse_args()
+
+    convert_rosbag_to_h5(
+        bag_path=args.bag,
+        output_h5_path=args.out,
+        start_offset_s=args.start_offset,
+        duration_s=args.duration,
+        events_topic=args.events_topic,
+        image_topic=args.image_topic,
+    )
