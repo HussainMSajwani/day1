@@ -1,41 +1,31 @@
 #%%
+# %matplotlib qt
 import h5py
 import numpy as np
-import tonic
+import matplotlib.pyplot as plt
 
-h5 = h5py.File('/home/aric/neuromorphic_workshop/workshop.h5', 'r')
 
-events = h5['events_data'][:]
-print(events.shape)
+H, W = 480, 640
 
-def arr_to_tonic(arr): #we will cover tonic later. For now just know that it is a format for storing events that is more memory efficient.
-    out = np.zeros(len(arr), dtype=[('x', '<i2'), ('y', '<i2'), ('p', '?'), ('t', '<f8')])
-    arr[:, 3] = arr[:, 3] * 1e6
-    arr[:, 3] = arr[:, 3] - arr[0, 3]
-    
-    out['x'] = arr[:, 0].astype(np.int16)
-    out['y'] = arr[:, 1].astype(np.int16)
-    out['p'] = arr[:, 2].astype(bool)
-    out['t'] = arr[:, 3].astype(np.float64)
+# drone_data = h5py.File('/home/aric/adasi/data/2025-07-17-12-49-53_full_testing.h5', 'r')
+shapes_data = h5py.File('/home/aric/adasi/data/shapes.h5', 'r')
+
+# drone_events = drone_data['events_data'][:]
+events = shapes_data['events_data'][:]
+
+print(events.dtype)
+print("We have {} events".format(len(events)))
+
+def get_events_between(events, t0, t1):
+    idx = np.where((events['t'] >= t0) & (events['t'] <= t1))[0]
+    out = events[idx]
     return out
 
-events = arr_to_tonic(events)
+t0 = 2.9
+t1 = t0 + 0.03 #a 30 ms window
 
-import matplotlib.pyplot as plt
-ts0 = events[0]['t']
-ts1 = events[-1]['t']
+sample = get_events_between(events, t0, t1)
 
-print("Time span: ", (ts1 - ts0) / 1e6, "seconds")
-
-#30 ms windows
-breaks = np.arange(ts0, ts1, 30e3)
-print("Number of 30 ms windows: ", len(breaks) - 1)
-
-breaks_idx = np.searchsorted(events['t'], breaks)
-counts = np.diff(breaks_idx)
-
-
-sample = events[breaks_idx[120]:breaks_idx[121]]
 #3D plot
 fig = plt.figure()
 ax = fig.add_subplot(111, projection='3d')
@@ -45,77 +35,122 @@ ax.set_xlabel('Time (us)')
 ax.set_ylabel('X')
 ax.set_zlabel('Y')
 
-#%%
+#%% Projection
 
-# frame = tonic.transforms.ToFrame(sensor_size=(346, 260, 2), time_window=30e3)(sample)
-frame = np.zeros((260, 346))
+img = np.zeros((H, W, 1), dtype=np.uint8) # W x H x C
+# Initialize an empty image with 3 channels (RGB)
+# Note: The dimensions (240, 346) should match the resolution of your event camera
 
-for e in sample:
-    frame[e['y'], e['x']] += 1
+for event in sample:
+    x, y, p = event['x'], event['y'], event['p']
 
-# print(frame[0, :, :].shape)
-# frame = np.concatenate([np.zeros((1, 260, 346)), frame[0, :, :]], axis=0)
-fig, ax = plt.subplots(1, 1)
-ax.imshow(frame, cmap='gray')
+    img[y, x, 0] = 255  
+    # if p:  # Positive event
+    #     img[y, x, 0] = 255
+    #     img[y, x, 1] = 0
+    #     img[y, x, 2] = 0
+    # else:  # Negative event
+    #     img[y, x, 0] = 0
+    #     img[y, x, 1] = 0
+    #     img[y, x, 2] = 255
+
+plt.figure(figsize=(15, 10))
+plt.imshow(img, cmap='gray')
+plt.xlabel('X (px)')
+plt.ylabel('Y (px)')
+plt.title('Events between {} and {} seconds'.format(t0, t1))
+plt.show()
+
+#%% histogram
+
+img = np.zeros((H, W, 1), dtype=np.uint8)
+
+for event in sample:
+    x, y, p = event['x'], event['y'], event['p']
+    img[y, x, 0] += 1
+
+img = img / img.max() * 255  # Normalize to 0-255 range
+img = img.astype(np.uint8)
+
+plt.figure(figsize=(15, 10))
+plt.imshow(img, cmap='gray')
+plt.xlabel('X (px)')
+plt.ylabel('Y (px)')
 plt.title('Histogram of events')
+plt.show()
+
 # %%
-frame = np.zeros((2, 260, 346))
+frame = np.zeros((H, W, 2))
 
 for e in sample:
-    frame[e['p']*1, e['y'], e['x']] += 1
+    frame[e['y'], e['x'], e['p']*1] += 1
 
-print(frame.shape)
 
-frame = np.concatenate([np.zeros((1, 260, 346)), frame[:, :, :]], axis=0)
-frame = np.transpose(frame, (1, 2, 0))
+frame = np.concatenate([np.zeros((H, W, 1)), frame], axis=2)
 print(frame.shape)
 fig, ax = plt.subplots(1, 1)
 
 ax.imshow(frame, cmap='gray')
 plt.title('Histogram of events by polarity')
+# %% Bonus voxel grid
 # %%
+tau = 1e-3  # seconds (3 ms)
 
+# Convert t_ref to seconds
+t_ref = sample['t'][-1] 
 
-voxel = tonic.transforms.ToVoxelGrid(sensor_size=(346, 260, 2), n_time_bins=4)(sample)
+# Initialize time surface (single channel)
+time_surface = np.zeros((H, W), dtype=np.float32)
 
-fig, axes = plt.subplots(2, 2, figsize=(5, 5), sharex=True, sharey=True)
+# Track last event time per pixel (in seconds)
+last_time = np.full((H, W), -np.inf, dtype=np.float32)
 
-for i in range(4):
-    ax = axes.flatten()[i]
-    print(voxel[i, 0 :, :].shape)
-    ax.imshow(voxel[i, 0 :, :][0], cmap='gray')
-    ax.set_title(f"Time bin {i+1}")
+# Fill in last_time from the event list
+for e in sample:
+    last_time[e['y'], e['x']] = e['t'] 
 
-plt.title('Voxel grid')
+# Compute exponential decay for each pixel
+valid_mask = last_time > -np.inf
+time_surface[valid_mask] = np.exp(-(t_ref - last_time[valid_mask]) / tau)
 
-# %%
-timesurface = np.zeros((260, 346))
-# t_norm = (sample['t'] - sample['t'][0]) / (sample['t'][-1] - sample['t'][0])
-tau = 0.02e6
-t_ref = sample['t'][-1]
-for i, e in enumerate(sample):
-    timesurface[e['y'], e['x']] = np.exp((e['t'] - t_ref) / tau)
-
-print(timesurface)
-
+# Display
 fig, ax = plt.subplots(1, 1)
-ax.imshow(timesurface, cmap='gray')
-plt.title('Time surface')
+ax.imshow(time_surface, cmap='gray')
+plt.title(r'Time Surface, $\tau = {:.1f}$ ms'.format(tau * 1e3))
+plt.show()
+
 
 # %%
-avg_timestamp = np.zeros((260, 346))
-t_norm = (sample['t'] - sample['t'][0]) / (sample['t'][-1] - sample['t'][0])
-counts = np.zeros((260, 346))
-for i, e in enumerate(sample):
-    avg_timestamp[e['y'], e['x']] += t_norm[i]
-    counts[e['y'], e['x']] += 1
+import numpy as np
+import matplotlib.pyplot as plt
 
-avg_timestamp = np.divide(avg_timestamp, counts, out=np.zeros_like(avg_timestamp), where=counts!=0)
+# --- Average Timestamp Surface ---
 
-fig, ax = plt.subplots(1, 1)
+# If your timestamps are in microseconds and you want seconds, set convert_to_seconds=True
+convert_to_seconds = False
 
-ax.imshow(avg_timestamp, cmap='gray')
-plt.title('Average timestamp')
+sum_time   = np.zeros((H, W), dtype=np.float64)
+count_time = np.zeros((H, W), dtype=np.int32)
+
+for e in sample:
+    t = e['t'] * 1e-6 if convert_to_seconds else e['t']
+    sum_time[e['y'], e['x']]   += t
+    count_time[e['y'], e['x']] += 1
+
+avg_ts = np.zeros((H, W), dtype=np.float32)
+valid  = count_time > 0
+avg_ts[valid] = (sum_time[valid] / count_time[valid]).astype(np.float32)
+
+avg_ts_norm = avg_ts / avg_ts.max() * 255
+
+# Plot
+fig, ax = plt.subplots(1, 1, figsize=(6, 4))
+im = ax.imshow(avg_ts_norm, cmap='gray')
+ax.set_title('Average Timestamp Surface (normalized)')
+ax.set_xticks([]); ax.set_yticks([])
+plt.tight_layout()
+plt.show()
+
 
 # %%
 plt.show()

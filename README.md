@@ -9,11 +9,7 @@ After collecting data during the workshop, you will have several ROS bag files (
 For example, to convert a drone flight data bag file named `drone_hdr.bag` to an HDF5 file, you can run the following command:
 
 ```bash
-python bag_to_h5.py drone_hdr.bag hdr_drone.h5 \
-    --events_topic /capture_node/events \
-    --image_topic /capture_node/camera/image \
-    --start_offset 53.0 \
-    --duration 5
+python bag_to_h5.py drone_hdr.bag hdr_drone.h5 --events_topic /capture_node/events --image_topic /capture_node/camera/image --start_offset 33.0 --duration 6
 ```
 
 It is recommended that you check the start_offset value by previewing the bag file in rqt_image_view or another ROS visualization tool. This helps you identify when the relevant data begins so you can skip any irrelevant initial parts of the recording.
